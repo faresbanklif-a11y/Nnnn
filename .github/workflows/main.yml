@@ -29,7 +29,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
       # ──────────────────────────────────────────────
       # 3. Locate the Android project
