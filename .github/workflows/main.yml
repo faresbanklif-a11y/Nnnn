@@ -1,74 +1,142 @@
-name: Ultimate Badass APK Builder
+name: Build Android APK from ZIP
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main", "رئيسي" ]
+    paths:
+      - 'project.zip'
+      - '**.gradle'
+      - '**.java'
+      - '**.kt'
+      - '**.xml'
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: 'Path to the ZIP file inside the repo (e.g. project.zip)'
+        required: false
+        default: 'project.zip'
 
 jobs:
   build:
+    name: Extract ZIP and Build APK
     runs-on: ubuntu-latest
+
     steps:
-      - name: 1. Checkout GitHub Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Smart Unzip and Auto-Structure Fix
-        run: |
-          # فك الضغط عن أي ملف زيب موجود
-          ZIP_FILE=$(ls *.zip | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then echo "No ZIP file found!"; exit 1; fi
-          unzip -o "$ZIP_FILE" -d extracted_temp
-          
-          # البحث عن المجلد الذي يحتوي على ملفات البرمجة الحقيقية (build.gradle)
-          REAL_PROJECT_DIR=$(find extracted_temp -name "build.gradle" | head -n 1 | xargs dirname)
-          
-          if [ -z "$REAL_PROJECT_DIR" ]; then
-            echo "Error: No Android project found inside the ZIP!"
-            exit 1
-          fi
-          
-          # نقل كل شيء للمجلد الرئيسي للعمل
-          cp -rn "$REAL_PROJECT_DIR"/. .
-          
-          # إصلاح أخطاء التسمية (مثل "res font" التي سببت خطأ سابقاً)
-          # هذا الأمر يبحث عن أي مجلد به مسافة ويستبدلها بشرطة سفلية
-          find . -type d -name "* *" -exec bash -c 'mv "$0" "${0// /_}"' {} \; || true
-          
-      - name: 3. Set up Java Environment (JDK 17)
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: 'temurin'
-          cache: gradle
+          java-version: '17'
+          cache: 'gradle'
 
-      - name: 4. Inject Missing Repositories (JitPack Fix)
+      - name: Detect ZIP file
+        id: find_zip
         run: |
-          # إضافة مخزن JitPack لحل مشكلة المكتبات المفقودة (مثل MPAndroidChart)
-          if [ -f "settings.gradle" ]; then
-            sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' settings.gradle || true
+          ZIP="${{ github.event.inputs.zip_file }}"
+          if [ -z "$ZIP" ]; then
+            ZIP=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
           fi
-          if [ -f "build.gradle" ]; then
-            sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' build.gradle || true
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No ZIP file found in the repository."
+            exit 1
           fi
+          echo "zip_path=$ZIP" >> $GITHUB_OUTPUT
+          echo "Found ZIP: $ZIP"
 
-      - name: 5. Setup Modern Gradle Engine
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: 8.5
-
-      - name: 6. Execute Build (Force System Gradle if needed)
+      - name: Extract ZIP file
         run: |
-          # محاولة التشغيل بالمحرك الأصلي، وإذا فشل نستخدم محرك النظام
-          if [ -f "./gradlew" ]; then
-            chmod +x gradlew
-            ./gradlew assembleDebug --stacktrace
+          ZIP="${{ steps.find_zip.outputs.zip_path }}"
+          echo "Extracting $ZIP ..."
+          mkdir -p extracted_project
+          unzip -o "$ZIP" -d extracted_project
+          echo "Contents after extraction:"
+          ls -la extracted_project/
+
+      - name: Locate Android project root
+        id: find_root
+        run: |
+          # Find the directory that contains settings.gradle or settings.gradle.kts
+          ROOT=$(find extracted_project -name "settings.gradle" -o -name "settings.gradle.kts" | head -n 1 | xargs dirname)
+          if [ -z "$ROOT" ]; then
+            echo "ERROR: Could not find Android project root (no settings.gradle found)."
+            echo "ZIP contents:"
+            find extracted_project -type f | head -50
+            exit 1
+          fi
+          echo "project_root=$ROOT" >> $GITHUB_OUTPUT
+          echo "Android project root: $ROOT"
+
+      - name: Make gradlew executable
+        run: |
+          ROOT="${{ steps.find_root.outputs.project_root }}"
+          if [ -f "$ROOT/gradlew" ]; then
+            chmod +x "$ROOT/gradlew"
+            echo "gradlew found and made executable."
           else
-            echo "gradlew not found, using system gradle..."
-            gradle assembleDebug --stacktrace
+            echo "WARNING: gradlew not found, will try to use system gradle."
           fi
 
-      - name: 7. Upload the Final Badass APK
+      - name: Validate Gradle wrapper (security check)
+        run: |
+          ROOT="${{ steps.find_root.outputs.project_root }}"
+          if [ -f "$ROOT/gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "gradle-wrapper.properties:"
+            cat "$ROOT/gradle/wrapper/gradle-wrapper.properties"
+          fi
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.find_root.outputs.project_root }}
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug --stacktrace --no-daemon \
+              -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Find generated APK files
+        id: find_apk
+        run: |
+          ROOT="${{ steps.find_root.outputs.project_root }}"
+          APK_FILES=$(find "$ROOT" -name "*.apk" -type f)
+          if [ -z "$APK_FILES" ]; then
+            echo "ERROR: No APK files found after build."
+            exit 1
+          fi
+          echo "Generated APKs:"
+          echo "$APK_FILES"
+          # Store the first APK path
+          FIRST_APK=$(echo "$APK_FILES" | head -n 1)
+          echo "first_apk=$FIRST_APK" >> $GITHUB_OUTPUT
+
+      - name: Rename APK with timestamp
+        id: rename_apk
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          SRC="${{ steps.find_apk.outputs.first_apk }}"
+          BASENAME=$(basename "$SRC" .apk)
+          DEST="output/${BASENAME}_${TIMESTAMP}.apk"
+          mkdir -p output
+          cp "$SRC" "$DEST"
+          echo "apk_output=$DEST" >> $GITHUB_OUTPUT
+          echo "APK ready: $DEST"
+
+      - name: Upload APK as GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: My-Powerful-App
-          path: "**/build/outputs/apk/debug/*.apk"
+          name: SiteForge-APK
+          path: output/*.apk
+          retention-days: 30
+
+      - name: Print success summary
+        run: |
+          echo "============================================"
+          echo "  BUILD SUCCESSFUL"
+          echo "============================================"
+          echo "  APK: ${{ steps.rename_apk.outputs.apk_output }}"
+          echo ""
+          echo "  Download from the Actions tab:"
+          echo "  -> Artifacts section -> SiteForge-APK"
+          echo "============================================"
