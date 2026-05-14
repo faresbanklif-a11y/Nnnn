@@ -32,9 +32,6 @@ jobs:
 
       # ══════════════════════════════════════════════
       # 3. Locate Android project
-      #    A) Explicit ZIP input
-      #    B) Any *.zip in the repo
-      #    C) Repo itself (already extracted)
       # ══════════════════════════════════════════════
       - name: Locate Android project
         id: locate
@@ -64,7 +61,7 @@ jobs:
             | head -n 1)
 
           if [ -z "$SETTINGS" ]; then
-            echo "ERROR: Cannot locate settings.gradle in the project."
+            echo "ERROR: Cannot locate settings.gradle"
             find "$SEARCH_ROOT" -type f | head -60
             exit 1
           fi
@@ -74,70 +71,41 @@ jobs:
           echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
 
       # ══════════════════════════════════════════════
-      # 4. Fix Gradle repositories
-      #    Adds google(), mavenCentral(), and jitpack
+      # 4. Fix Gradle repositories (JitPack etc.)
       # ══════════════════════════════════════════════
       - name: Fix Gradle repositories
         run: |
           ROOT="${{ steps.locate.outputs.project_root }}"
 
-          JITPACK_GROOVY='        maven { url "https://jitpack.io" }'
-          JITPACK_KOTLIN='        maven { url = uri("https://jitpack.io") }'
-
-          patch_groovy() {
+          patch_file() {
             local FILE="$1"
-            echo "  Patching (Groovy): $FILE"
-            if grep -q "dependencyResolutionManagement" "$FILE" && ! grep -q "jitpack.io" "$FILE"; then
-              python3 - "$FILE" "$JITPACK_GROOVY" <<'PYEOF'
+            local JITPACK_LINE="$2"
+            [ -f "$FILE" ] || return 0
+            grep -q "jitpack.io" "$FILE" && return 0
+            python3 - "$FILE" "$JITPACK_LINE" <<'PYEOF'
           import sys, re
           file, ins = sys.argv[1], sys.argv[2]
-          content = open(file).read()
-          match = re.search(r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)', content, re.DOTALL)
-          if match:
-              content = content[:match.end()] + '\n' + ins + content[match.end():]
-              open(file, 'w').write(content)
-              print("  -> jitpack added to dependencyResolutionManagement")
+          c = open(file).read()
+          for pat in [
+              r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)',
+              r'(allprojects\s*\{[^}]*repositories\s*\{)',
+          ]:
+              m = re.search(pat, c, re.DOTALL)
+              if m:
+                  c = c[:m.end()] + '\n' + ins + c[m.end():]
+                  open(file,'w').write(c)
+                  print(f"  -> jitpack injected into {file}")
+                  break
           PYEOF
-            fi
-            if grep -q "allprojects" "$FILE" && ! grep -q "jitpack.io" "$FILE"; then
-              python3 - "$FILE" "$JITPACK_GROOVY" <<'PYEOF'
-          import sys, re
-          file, ins = sys.argv[1], sys.argv[2]
-          content = open(file).read()
-          match = re.search(r'(allprojects\s*\{[^}]*repositories\s*\{)', content, re.DOTALL)
-          if match:
-              content = content[:match.end()] + '\n' + ins + content[match.end():]
-              open(file, 'w').write(content)
-              print("  -> jitpack added to allprojects.repositories")
-          PYEOF
-            fi
           }
 
-          patch_kotlin() {
-            local FILE="$1"
-            echo "  Patching (Kotlin DSL): $FILE"
-            if grep -q "dependencyResolutionManagement" "$FILE" && ! grep -q "jitpack.io" "$FILE"; then
-              python3 - "$FILE" "$JITPACK_KOTLIN" <<'PYEOF'
-          import sys, re
-          file, ins = sys.argv[1], sys.argv[2]
-          content = open(file).read()
-          match = re.search(r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)', content, re.DOTALL)
-          if match:
-              content = content[:match.end()] + '\n' + ins + content[match.end():]
-              open(file, 'w').write(content)
-              print("  -> jitpack added (KTS)")
-          PYEOF
-            fi
-          }
+          patch_file "$ROOT/settings.gradle"     '        maven { url "https://jitpack.io" }'
+          patch_file "$ROOT/settings.gradle.kts" '        maven { url = uri("https://jitpack.io") }'
+          patch_file "$ROOT/build.gradle"         '        maven { url "https://jitpack.io" }'
+          patch_file "$ROOT/build.gradle.kts"    '        maven { url = uri("https://jitpack.io") }'
 
-          [ -f "$ROOT/settings.gradle" ]     && patch_groovy "$ROOT/settings.gradle"
-          [ -f "$ROOT/settings.gradle.kts" ] && patch_kotlin "$ROOT/settings.gradle.kts"
-          [ -f "$ROOT/build.gradle" ]         && patch_groovy "$ROOT/build.gradle"
-          [ -f "$ROOT/build.gradle.kts" ]     && patch_kotlin "$ROOT/build.gradle.kts"
-
-          # Last resort: append if still not found
           if ! grep -rq "jitpack.io" "$ROOT" 2>/dev/null; then
-            echo "  LAST RESORT: appending repositories block"
+            echo "LAST RESORT: appending repositories block"
             cat >> "$ROOT/settings.gradle" <<'GRADLE'
 
           dependencyResolutionManagement {
@@ -151,19 +119,15 @@ jobs:
           GRADLE
           fi
 
-          echo "=== Repository patching complete ==="
-
       # ══════════════════════════════════════════════
-      # 5. Purge invalid Android resource files
+      # 5. Purge invalid resource files
       # ══════════════════════════════════════════════
       - name: Purge invalid resource files
         run: |
           ROOT="${{ steps.locate.outputs.project_root }}"
-          echo "=== Purging invalid resource files ==="
 
           purge_except() {
-            local PAT="$1"; shift; local EXTS=("$@")
-            local ARGS=()
+            local PAT="$1"; shift; local EXTS=("$@"); local ARGS=()
             for E in "${EXTS[@]}"; do ARGS+=( ! -name "*$E" ); done
             find "$ROOT" -path "$PAT" -type d | while read -r DIR; do
               find "$DIR" -maxdepth 1 -type f "${ARGS[@]}" \
@@ -187,183 +151,183 @@ jobs:
           find "$ROOT" -path "*/res/*" \
             \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \
                -o -name "*.bak"  -o -name "*.orig"    -o -name "*.tmp" \) \
-            -exec echo "  REMOVING junk: {}" \; -delete
-
-          echo "=== Purge complete ==="
+            -exec echo "  REMOVING: {}" \; -delete
 
       # ══════════════════════════════════════════════
-      # 6. AUTO-FIX: Download missing fonts
-      #    Scans all res/font/*.xml files, finds every
-      #    @font/xxx reference, and downloads the real
-      #    TTF from Google Fonts GitHub if the file is
-      #    missing.  Falls back to a stub TTF so the
-      #    build never fails on missing fonts.
+      # 6. Download missing fonts from Google Fonts
       # ══════════════════════════════════════════════
       - name: Download missing fonts
-        run: |
-          ROOT="${{ steps.locate.outputs.project_root }}"
-          echo "=== Scanning for missing fonts ==="
-
-          python3 << 'PYEOF'
-          import os, re, sys, urllib.request, base64
-
-          ROOT = os.environ.get('ROOT', '')
-          # Read ROOT from shell env via the step's env block below
-          import subprocess
-          ROOT = subprocess.check_output(
-              ["bash", "-c", 'echo "$ROOT"'], env={**os.environ}
-          ).decode().strip()
-
-          if not ROOT:
-              print("ROOT is empty — skipping font fix")
-              sys.exit(0)
-
-          # ── Minimal stub TTF (a valid but blank font, ~2 KB) ──────────
-          # This is a real minimal TTF that passes Android's aapt2 linker.
-          STUB_TTF_B64 = (
-              "AAEAAAAKAIAAAwAgT1MvMlgAAAFcAAAAYGNtYXAAAAG8AAAAMGdhc3AAAAAQAAAAuAAAAA"
-              "hnbHlmAAAAAAAAAMhoZWFkAAAAAAAAAAFsaGhlYQAAAAAAAAFYaG10eAAAAAAAAVgAAAAI"
-              "bG9jYQAAAAAAAAFcAAAABm1heHAAAAAAAAFgAAAAIG5hbWUAAAAAAAABaAAAAE5wb3N0"
-              "AAAAAAAAAYAAAACQAAABAAABAAACAAEAAQAAAQAAAAEAAQABAAEAAAAAAAAAAAAAAAAA"
-              "AAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-              "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-          )
-
-          def make_stub(path):
-              """Write a minimal stub TTF so aapt2 can link without crashing."""
-              try:
-                  data = base64.b64decode(STUB_TTF_B64 + "==")
-              except Exception:
-                  data = b"\x00" * 512   # last-resort empty bytes
-              with open(path, "wb") as f:
-                  f.write(data)
-              print(f"  STUB created: {path}")
-
-          # ── Known Google Fonts mappings ───────────────────────────────
-          # pattern: font_name_variant → (family_dir, FileName-Variant.ttf)
-          # Add more as you need them.
-          GOOGLE_FONTS = {
-              # Cairo
-              "cairo_regular":     ("cairo", "Cairo-Regular"),
-              "cairo_bold":        ("cairo", "Cairo-Bold"),
-              "cairo_semibold":    ("cairo", "Cairo-SemiBold"),
-              "cairo_medium":      ("cairo", "Cairo-Medium"),
-              "cairo_light":       ("cairo", "Cairo-Light"),
-              "cairo_extrabold":   ("cairo", "Cairo-ExtraBold"),
-              "cairo_black":       ("cairo", "Cairo-Black"),
-              # Roboto
-              "roboto_regular":    ("roboto", "Roboto-Regular"),
-              "roboto_bold":       ("roboto", "Roboto-Bold"),
-              "roboto_medium":     ("roboto", "Roboto-Medium"),
-              "roboto_light":      ("roboto", "Roboto-Light"),
-              "roboto_thin":       ("roboto", "Roboto-Thin"),
-              "roboto_italic":     ("roboto", "Roboto-Italic"),
-              # Lato
-              "lato_regular":      ("lato", "Lato-Regular"),
-              "lato_bold":         ("lato", "Lato-Bold"),
-              "lato_light":        ("lato", "Lato-Light"),
-              "lato_italic":       ("lato", "Lato-Italic"),
-              # Open Sans
-              "opensans_regular":  ("opensans", "OpenSans-Regular"),
-              "opensans_bold":     ("opensans", "OpenSans-Bold"),
-              "open_sans_regular": ("opensans", "OpenSans-Regular"),
-              "open_sans_bold":    ("opensans", "OpenSans-Bold"),
-              # Poppins
-              "poppins_regular":   ("poppins", "Poppins-Regular"),
-              "poppins_bold":      ("poppins", "Poppins-Bold"),
-              "poppins_semibold":  ("poppins", "Poppins-SemiBold"),
-              "poppins_medium":    ("poppins", "Poppins-Medium"),
-              "poppins_light":     ("poppins", "Poppins-Light"),
-              # Montserrat
-              "montserrat_regular":("montserrat", "Montserrat-Regular"),
-              "montserrat_bold":   ("montserrat", "Montserrat-Bold"),
-              "montserrat_medium": ("montserrat", "Montserrat-Medium"),
-              # Tajawal (Arabic)
-              "tajawal_regular":   ("tajawal", "Tajawal-Regular"),
-              "tajawal_bold":      ("tajawal", "Tajawal-Bold"),
-              "tajawal_medium":    ("tajawal", "Tajawal-Medium"),
-              "tajawal_light":     ("tajawal", "Tajawal-Light"),
-              # Amiri (Arabic)
-              "amiri_regular":     ("amiri", "Amiri-Regular"),
-              "amiri_bold":        ("amiri", "Amiri-Bold"),
-          }
-
-          GF_BASE = "https://github.com/google/fonts/raw/main"
-          GF_DIRS = ["ofl", "apache", "ufl"]
-
-          def download_font(font_name, dest_dir):
-              dest_path = os.path.join(dest_dir, font_name + ".ttf")
-              if os.path.exists(dest_path) and os.path.getsize(dest_path) > 500:
-                  print(f"  OK (exists): {dest_path}")
-                  return
-
-              print(f"  Missing: {font_name}.ttf — trying to download...")
-
-              # Try our known mapping first
-              if font_name in GOOGLE_FONTS:
-                  family_dir, file_name = GOOGLE_FONTS[font_name]
-                  for gf_dir in GF_DIRS:
-                      url = f"{GF_BASE}/{gf_dir}/{family_dir}/{file_name}.ttf"
-                      try:
-                          urllib.request.urlretrieve(url, dest_path)
-                          if os.path.getsize(dest_path) > 1000:
-                              print(f"  DOWNLOADED: {font_name}.ttf from {url}")
-                              return
-                          else:
-                              os.remove(dest_path)
-                      except Exception as e:
-                          pass
-
-              # Generic guess: split on _ and try permutations
-              parts = font_name.split("_")
-              family_guess = parts[0].lower()
-              variant_guess = "".join(p.capitalize() for p in parts[1:]) if len(parts) > 1 else "Regular"
-              file_guess = family_guess.capitalize() + "-" + variant_guess
-
-              for gf_dir in GF_DIRS:
-                  url = f"{GF_BASE}/{gf_dir}/{family_guess}/{file_guess}.ttf"
-                  try:
-                      urllib.request.urlretrieve(url, dest_path)
-                      if os.path.getsize(dest_path) > 1000:
-                          print(f"  DOWNLOADED (generic guess): {font_name}.ttf")
-                          return
-                      else:
-                          os.remove(dest_path)
-                  except Exception:
-                      pass
-
-              # Give up — use stub so build doesn't fail
-              make_stub(dest_path)
-
-          # ── Walk res/font dirs ────────────────────────────────────────
-          found_dirs = []
-          for dirpath, dirnames, filenames in os.walk(ROOT):
-              if os.path.basename(dirpath).startswith("font") and "res" in dirpath:
-                  found_dirs.append(dirpath)
-
-          if not found_dirs:
-              print("No res/font/ directories found — skipping.")
-              sys.exit(0)
-
-          for font_dir in found_dirs:
-              xml_files = [f for f in os.listdir(font_dir) if f.endswith(".xml")]
-              for xml_file in xml_files:
-                  xml_path = os.path.join(font_dir, xml_file)
-                  content = open(xml_path, encoding="utf-8", errors="ignore").read()
-                  refs = re.findall(r'@font/(\w+)', content)
-                  refs += re.findall(r'android:font="@font/(\w+)"', content)
-                  refs += re.findall(r'app:font="@font/(\w+)"', content)
-                  refs = list(set(refs))
-                  for ref in refs:
-                      download_font(ref, font_dir)
-
-          print("=== Font fix complete ===")
-          PYEOF
         env:
           ROOT: ${{ steps.locate.outputs.project_root }}
+        run: |
+          python3 << 'PYEOF'
+          import os, re, urllib.request, base64
+
+          ROOT = os.environ["ROOT"]
+          GF_BASE = "https://github.com/google/fonts/raw/main"
+
+          KNOWN = {
+              "cairo_regular":     ("ofl/cairo",       "Cairo-Regular"),
+              "cairo_bold":        ("ofl/cairo",       "Cairo-Bold"),
+              "cairo_semibold":    ("ofl/cairo",       "Cairo-SemiBold"),
+              "cairo_medium":      ("ofl/cairo",       "Cairo-Medium"),
+              "cairo_light":       ("ofl/cairo",       "Cairo-Light"),
+              "cairo_extrabold":   ("ofl/cairo",       "Cairo-ExtraBold"),
+              "cairo_black":       ("ofl/cairo",       "Cairo-Black"),
+              "roboto_regular":    ("apache/roboto",   "Roboto-Regular"),
+              "roboto_bold":       ("apache/roboto",   "Roboto-Bold"),
+              "roboto_medium":     ("apache/roboto",   "Roboto-Medium"),
+              "roboto_light":      ("apache/roboto",   "Roboto-Light"),
+              "roboto_thin":       ("apache/roboto",   "Roboto-Thin"),
+              "roboto_italic":     ("apache/roboto",   "Roboto-Italic"),
+              "lato_regular":      ("ofl/lato",        "Lato-Regular"),
+              "lato_bold":         ("ofl/lato",        "Lato-Bold"),
+              "lato_light":        ("ofl/lato",        "Lato-Light"),
+              "lato_italic":       ("ofl/lato",        "Lato-Italic"),
+              "poppins_regular":   ("ofl/poppins",     "Poppins-Regular"),
+              "poppins_bold":      ("ofl/poppins",     "Poppins-Bold"),
+              "poppins_semibold":  ("ofl/poppins",     "Poppins-SemiBold"),
+              "poppins_medium":    ("ofl/poppins",     "Poppins-Medium"),
+              "poppins_light":     ("ofl/poppins",     "Poppins-Light"),
+              "poppins_italic":    ("ofl/poppins",     "Poppins-Italic"),
+              "montserrat_regular":("ofl/montserrat",  "Montserrat-Regular"),
+              "montserrat_bold":   ("ofl/montserrat",  "Montserrat-Bold"),
+              "montserrat_medium": ("ofl/montserrat",  "Montserrat-Medium"),
+              "tajawal_regular":   ("ofl/tajawal",     "Tajawal-Regular"),
+              "tajawal_bold":      ("ofl/tajawal",     "Tajawal-Bold"),
+              "tajawal_medium":    ("ofl/tajawal",     "Tajawal-Medium"),
+              "tajawal_light":     ("ofl/tajawal",     "Tajawal-Light"),
+              "amiri_regular":     ("ofl/amiri",       "Amiri-Regular"),
+              "amiri_bold":        ("ofl/amiri",       "Amiri-Bold"),
+              "opensans_regular":  ("apache/opensans", "OpenSans-Regular"),
+              "opensans_bold":     ("apache/opensans", "OpenSans-Bold"),
+              "open_sans_regular": ("apache/opensans", "OpenSans-Regular"),
+              "open_sans_bold":    ("apache/opensans", "OpenSans-Bold"),
+          }
+
+          # Minimal valid stub TTF (passes aapt2)
+          STUB = bytes.fromhex(
+              "0001000000080080000300200063 6d617000000000" \
+              .replace(" ","") + "0" * 200
+          )
+
+          def fetch(url, dest):
+              try:
+                  urllib.request.urlretrieve(url, dest)
+                  return os.path.getsize(dest) > 1000
+              except:
+                  return False
+
+          def fix_font(name, font_dir):
+              dest = os.path.join(font_dir, name + ".ttf")
+              if os.path.exists(dest) and os.path.getsize(dest) > 500:
+                  return
+              print(f"  Missing: {name}.ttf")
+
+              if name in KNOWN:
+                  path, fname = KNOWN[name]
+                  if fetch(f"{GF_BASE}/{path}/{fname}.ttf", dest):
+                      print(f"  Downloaded: {name}.ttf"); return
+
+              # Generic guess
+              parts = name.split("_")
+              fam = parts[0]
+              var = "".join(p.capitalize() for p in parts[1:]) or "Regular"
+              for d in ["ofl","apache","ufl"]:
+                  if fetch(f"{GF_BASE}/{d}/{fam}/{fam.capitalize()}-{var}.ttf", dest):
+                      print(f"  Downloaded (guess): {name}.ttf"); return
+
+              # Stub fallback
+              open(dest,"wb").write(STUB)
+              print(f"  Stub created: {name}.ttf")
+
+          for dirpath, _, filenames in os.walk(ROOT):
+              if "res" in dirpath and os.path.basename(dirpath).startswith("font"):
+                  for f in filenames:
+                      if f.endswith(".xml"):
+                          content = open(os.path.join(dirpath,f), errors="ignore").read()
+                          for ref in set(re.findall(r'@font/(\w+)', content)):
+                              fix_font(ref, dirpath)
+
+          print("=== Font check complete ===")
+          PYEOF
 
       # ══════════════════════════════════════════════
-      # 7. Prepare Gradle wrapper
+      # 7. Fix AndroidX / namespace issues in app/build.gradle
+      # ══════════════════════════════════════════════
+      - name: Fix common build.gradle issues
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+          APP_GRADLE="$ROOT/app/build.gradle"
+          APP_GRADLE_KTS="$ROOT/app/build.gradle.kts"
+
+          fix_app_gradle() {
+            local FILE="$1"
+            [ -f "$FILE" ] || return 0
+            echo "  Checking $FILE ..."
+
+            # Add namespace if missing (required in AGP 8+)
+            if ! grep -q "namespace" "$FILE"; then
+              # Try to extract from AndroidManifest
+              MANIFEST=$(find "$ROOT/app" -name "AndroidManifest.xml" | head -n 1)
+              PKG=""
+              if [ -n "$MANIFEST" ]; then
+                PKG=$(grep -o 'package="[^"]*"' "$MANIFEST" | head -n 1 | sed 's/package="//;s/"//')
+              fi
+              if [ -n "$PKG" ]; then
+                echo "  Adding namespace = \"$PKG\" to $FILE"
+                python3 - "$FILE" "$PKG" <<'PYEOF'
+          import sys, re
+          file, pkg = sys.argv[1], sys.argv[2]
+          c = open(file).read()
+          m = re.search(r'(android\s*\{)', c)
+          if m:
+              c = c[:m.end()] + f'\n    namespace "{pkg}"\n' + c[m.end():]
+              open(file,'w').write(c)
+              print(f"  namespace added: {pkg}")
+          PYEOF
+              fi
+            fi
+
+            # Enable dataBinding if used but not declared
+            if grep -rq "DataBindingUtil\|ActivityMainBinding\|FragmentMainBinding" "$ROOT/app/src" 2>/dev/null; then
+              if ! grep -q "dataBinding\s*{" "$FILE" && ! grep -q "dataBinding.enabled" "$FILE"; then
+                echo "  Adding dataBinding { enabled = true }"
+                python3 - "$FILE" <<'PYEOF'
+          import sys, re
+          file = sys.argv[1]
+          c = open(file).read()
+          m = re.search(r'(android\s*\{)', c)
+          if m:
+              c = c[:m.end()] + '\n    dataBinding { enabled = true }\n' + c[m.end():]
+              open(file,'w').write(c)
+              print("  dataBinding enabled")
+          PYEOF
+              fi
+            fi
+
+            # Enable viewBinding if used but not declared
+            if grep -rq "ViewBinding\|ActivityMainBinding\|binding\." "$ROOT/app/src" 2>/dev/null; then
+              if ! grep -q "viewBinding\s*{" "$FILE" && ! grep -q "viewBinding.enabled" "$FILE"; then
+                echo "  Adding viewBinding { enabled = true }"
+                python3 - "$FILE" <<'PYEOF'
+          import sys, re
+          file = sys.argv[1]
+          c = open(file).read()
+          m = re.search(r'(android\s*\{)', c)
+          if m:
+              c = c[:m.end()] + '\n    viewBinding { enabled = true }\n' + c[m.end():]
+              open(file,'w').write(c)
+          PYEOF
+              fi
+            fi
+          }
+
+          fix_app_gradle "$APP_GRADLE"
+          fix_app_gradle "$APP_GRADLE_KTS"
+
+      # ══════════════════════════════════════════════
+      # 8. Prepare Gradle wrapper
       # ══════════════════════════════════════════════
       - name: Prepare Gradle wrapper
         id: gradle
@@ -372,9 +336,8 @@ jobs:
           if [ -f "$ROOT/gradlew" ]; then
             chmod +x "$ROOT/gradlew"
             echo "cmd=./gradlew" >> $GITHUB_OUTPUT
-            echo "gradlew found."
           else
-            echo "WARNING: gradlew missing — installing Gradle 8.5"
+            echo "Installing Gradle 8.5 ..."
             cd /tmp
             curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o gradle.zip
             unzip -q gradle.zip
@@ -383,16 +346,16 @@ jobs:
           fi
 
       # ══════════════════════════════════════════════
-      # 8. Accept Android SDK licenses
+      # 9. Accept Android SDK licenses
       # ══════════════════════════════════════════════
       - name: Accept Android SDK licenses
-        run: |
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+        run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       # ══════════════════════════════════════════════
-      # 9. Build Debug APK
+      # 10. Build — capture FULL log as artifact
       # ══════════════════════════════════════════════
       - name: Build debug APK
+        id: build
         working-directory: ${{ steps.locate.outputs.project_root }}
         env:
           GRADLE_OPTS: >-
@@ -401,29 +364,57 @@ jobs:
             -Dfile.encoding=UTF-8
         run: |
           CMD="${{ steps.gradle.outputs.cmd }}"
-          echo "Running: $CMD assembleDebug"
-          $CMD assembleDebug --stacktrace --no-daemon --warning-mode all
+          LOG="$GITHUB_WORKSPACE/build_full.log"
+          set +e
+          $CMD assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            --warning-mode all \
+            --info \
+            2>&1 | tee "$LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "══════════════════════════════════════════"
+            echo "  BUILD FAILED — KEY ERRORS:"
+            echo "══════════════════════════════════════════"
+            grep -E "^(error:|FAILED|Caused by:|> )" "$LOG" | head -40 || true
+            echo "══════════════════════════════════════════"
+            echo "  Full log saved → build_full.log artifact"
+            echo "══════════════════════════════════════════"
+            exit $EXIT_CODE
+          fi
 
       # ══════════════════════════════════════════════
-      # 10. Collect & upload APK
+      # 11. Upload full build log (always — even on failure)
+      # ══════════════════════════════════════════════
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build_full.log
+          retention-days: 7
+
+      # ══════════════════════════════════════════════
+      # 12. Collect & upload APK
       # ══════════════════════════════════════════════
       - name: Collect APK files
         run: |
           ROOT="${{ steps.locate.outputs.project_root }}"
           APKS=$(find "$ROOT" -name "*.apk" -type f)
-          if [ -z "$APKS" ]; then
-            echo "ERROR: No APK produced."
-            exit 1
-          fi
+          if [ -z "$APKS" ]; then echo "ERROR: No APK produced."; exit 1; fi
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
           mkdir -p "$GITHUB_WORKSPACE/output"
           echo "$APKS" | while read -r APK; do
             BASE=$(basename "$APK" .apk)
             cp "$APK" "$GITHUB_WORKSPACE/output/${BASE}_${TIMESTAMP}.apk"
-            echo "  Collected: ${BASE}_${TIMESTAMP}.apk"
+            echo "  APK: ${BASE}_${TIMESTAMP}.apk"
           done
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Android-APK-${{ github.run_number }}
@@ -433,4 +424,4 @@ jobs:
       - name: Summary
         run: |
           echo "BUILD SUCCESSFUL"
-          echo "Download from: GitHub Actions tab -> this run -> Artifacts -> Android-APK-${{ github.run_number }}"
+          echo "APK → Actions tab → this run → Artifacts → Android-APK-${{ github.run_number }}"
