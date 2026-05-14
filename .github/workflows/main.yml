@@ -1,4 +1,4 @@
-name: Build APK From ZIP
+name: Ultimate Badass APK Builder
 
 on:
   workflow_dispatch:
@@ -9,42 +9,66 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: 1. Checkout GitHub Repository
+        uses: actions/checkout@v4
 
-      - name: Unzip and Fix Repositories
+      - name: 2. Smart Unzip and Auto-Structure Fix
         run: |
-          # 1. فك الضغط
+          # فك الضغط عن أي ملف زيب موجود
           ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip "$ZIP_FILE" -d temp_data
+          if [ -z "$ZIP_FILE" ]; then echo "No ZIP file found!"; exit 1; fi
+          unzip -o "$ZIP_FILE" -d extracted_temp
           
-          # 2. نقل الملفات للمسار الرئيسي
-          CONF_FILE=$(find temp_data -name "settings.gradle" | head -n 1)
-          PROJECT_DIR=$(dirname "$CONF_FILE")
-          cp -rn "$PROJECT_DIR"/* .
+          # البحث عن المجلد الذي يحتوي على ملفات البرمجة الحقيقية (build.gradle)
+          REAL_PROJECT_DIR=$(find extracted_temp -name "build.gradle" | head -n 1 | xargs dirname)
           
-          # 3. خطوة "الحقن" السحرية: إضافة مخزن JitPack لكل الملفات
-          # سنضيفه لملف settings.gradle وملف build.gradle لضمان النجاح
-          sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' settings.gradle || true
-          sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' build.gradle || true
+          if [ -z "$REAL_PROJECT_DIR" ]; then
+            echo "Error: No Android project found inside the ZIP!"
+            exit 1
+          fi
           
-      - name: Set up JDK 17
+          # نقل كل شيء للمجلد الرئيسي للعمل
+          cp -rn "$REAL_PROJECT_DIR"/. .
+          
+          # إصلاح أخطاء التسمية (مثل "res font" التي سببت خطأ سابقاً)
+          # هذا الأمر يبحث عن أي مجلد به مسافة ويستبدلها بشرطة سفلية
+          find . -type d -name "* *" -exec bash -c 'mv "$0" "${0// /_}"' {} \; || true
+          
+      - name: 3. Set up Java Environment (JDK 17)
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: gradle
 
-      - name: Setup Gradle
+      - name: 4. Inject Missing Repositories (JitPack Fix)
+        run: |
+          # إضافة مخزن JitPack لحل مشكلة المكتبات المفقودة (مثل MPAndroidChart)
+          if [ -f "settings.gradle" ]; then
+            sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' settings.gradle || true
+          fi
+          if [ -f "build.gradle" ]; then
+            sed -i '/repositories {/a \        maven { url "https://jitpack.io" }' build.gradle || true
+          fi
+
+      - name: 5. Setup Modern Gradle Engine
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.5
 
-      - name: Build APK (Fixing Dependencies)
+      - name: 6. Execute Build (Force System Gradle if needed)
         run: |
-          chmod +x gradlew || true
-          ./gradlew assembleDebug --stacktrace
+          # محاولة التشغيل بالمحرك الأصلي، وإذا فشل نستخدم محرك النظام
+          if [ -f "./gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace
+          else
+            echo "gradlew not found, using system gradle..."
+            gradle assembleDebug --stacktrace
+          fi
 
-      - name: Upload APK
+      - name: 7. Upload the Final Badass APK
         uses: actions/upload-artifact@v4
         with:
-          name: My-Badass-App
+          name: My-Powerful-App
           path: "**/build/outputs/apk/debug/*.apk"
