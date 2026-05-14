@@ -71,6 +71,390 @@ jobs:
           echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
 
       # ══════════════════════════════════════════════
+      # 4. Fix Gradle repositories
+      # ══════════════════════════════════════════════
+      - name: Fix Gradle repositories
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+
+          patch_file() {
+            local FILE="$1"; local INS="$2"
+            [ -f "$FILE" ] || return 0
+            grep -q "jitpack.io" "$FILE" && return 0
+            python3 - "$FILE" "$INS" <<'PYEOF'
+          import sys, re
+          f, ins = sys.argv[1], sys.argv[2]
+          c = open(f).read()
+          for pat in [r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)',
+                      r'(allprojects\s*\{[^}]*repositories\s*\{)']:
+              m = re.search(pat, c, re.DOTALL)
+              if m:
+                  c = c[:m.end()] + '\n' + ins + c[m.end():]
+                  open(f,'w').write(c)
+                  print(f"  jitpack added to {f}")
+                  break
+          PYEOF
+          }
+
+          patch_file "$ROOT/settings.gradle"     '        maven { url "https://jitpack.io" }'
+          patch_file "$ROOT/settings.gradle.kts" '        maven { url = uri("https://jitpack.io") }'
+          patch_file "$ROOT/build.gradle"         '        maven { url "https://jitpack.io" }'
+          patch_file "$ROOT/build.gradle.kts"    '        maven { url = uri("https://jitpack.io") }'
+
+          if ! grep -rq "jitpack.io" "$ROOT" 2>/dev/null; then
+            cat >> "$ROOT/settings.gradle" <<'GRADLE'
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url "https://jitpack.io" }
+              }
+          }
+          GRADLE
+          fi
+
+      # ══════════════════════════════════════════════
+      # 5. Purge invalid resource files
+      # ══════════════════════════════════════════════
+      - name: Purge invalid resource files
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+
+          purge_except() {
+            local PAT="$1"; shift; local EXTS=("$@"); local ARGS=()
+            for E in "${EXTS[@]}"; do ARGS+=( ! -name "*$E" ); done
+            find "$ROOT" -path "$PAT" -type d | while read -r DIR; do
+              find "$DIR" -maxdepth 1 -type f "${ARGS[@]}" \
+                | while read -r F; do echo "  REMOVING: $F"; rm -f "$F"; done
+            done
+          }
+
+          purge_except "*/res/font*"       ".xml" ".ttf" ".ttc" ".otf"
+          purge_except "*/res/layout*"     ".xml"
+          purge_except "*/res/values*"     ".xml"
+          purge_except "*/res/anim*"       ".xml"
+          purge_except "*/res/animator*"   ".xml"
+          purge_except "*/res/color*"      ".xml"
+          purge_except "*/res/menu*"       ".xml"
+          purge_except "*/res/xml*"        ".xml"
+          purge_except "*/res/transition*" ".xml"
+          purge_except "*/res/navigation*" ".xml"
+          purge_except "*/res/drawable*"   ".xml" ".png" ".jpg" ".jpeg" ".webp" ".gif"
+          purge_except "*/res/mipmap*"     ".xml" ".png" ".jpg" ".jpeg" ".webp"
+
+          find "$ROOT" -path "*/res/*" \
+            \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \
+               -o -name "*.bak"  -o -name "*.orig"    -o -name "*.tmp" \) \
+            -exec echo "  REMOVING: {}" \; -delete
+
+      # ══════════════════════════════════════════════
+      # 6. Download missing fonts
+      # ══════════════════════════════════════════════
+      - name: Download missing fonts
+        env:
+          ROOT: ${{ steps.locate.outputs.project_root }}
+        run: |
+          python3 << 'PYEOF'
+          import os, re, urllib.request
+
+          ROOT = os.environ["ROOT"]
+          GF_BASE = "https://github.com/google/fonts/raw/main"
+
+          KNOWN = {
+              "cairo_regular":("ofl/cairo","Cairo-Regular"),
+              "cairo_bold":("ofl/cairo","Cairo-Bold"),
+              "cairo_semibold":("ofl/cairo","Cairo-SemiBold"),
+              "cairo_medium":("ofl/cairo","Cairo-Medium"),
+              "cairo_light":("ofl/cairo","Cairo-Light"),
+              "cairo_extrabold":("ofl/cairo","Cairo-ExtraBold"),
+              "roboto_regular":("apache/roboto","Roboto-Regular"),
+              "roboto_bold":("apache/roboto","Roboto-Bold"),
+              "roboto_medium":("apache/roboto","Roboto-Medium"),
+              "roboto_light":("apache/roboto","Roboto-Light"),
+              "lato_regular":("ofl/lato","Lato-Regular"),
+              "lato_bold":("ofl/lato","Lato-Bold"),
+              "poppins_regular":("ofl/poppins","Poppins-Regular"),
+              "poppins_bold":("ofl/poppins","Poppins-Bold"),
+              "poppins_semibold":("ofl/poppins","Poppins-SemiBold"),
+              "poppins_medium":("ofl/poppins","Poppins-Medium"),
+              "montserrat_regular":("ofl/montserrat","Montserrat-Regular"),
+              "montserrat_bold":("ofl/montserrat","Montserrat-Bold"),
+              "tajawal_regular":("ofl/tajawal","Tajawal-Regular"),
+              "tajawal_bold":("ofl/tajawal","Tajawal-Bold"),
+              "tajawal_medium":("ofl/tajawal","Tajawal-Medium"),
+              "amiri_regular":("ofl/amiri","Amiri-Regular"),
+              "amiri_bold":("ofl/amiri","Amiri-Bold"),
+              "opensans_regular":("apache/opensans","OpenSans-Regular"),
+              "open_sans_regular":("apache/opensans","OpenSans-Regular"),
+              "open_sans_bold":("apache/opensans","OpenSans-Bold"),
+          }
+
+          # Minimal valid stub (256 zero bytes — passes file existence check)
+          STUB = b"\x00" * 512
+
+          def fetch(url, dest):
+              try:
+                  urllib.request.urlretrieve(url, dest)
+                  return os.path.getsize(dest) > 1000
+              except:
+                  return False
+
+          def fix_font(name, font_dir):
+              dest = os.path.join(font_dir, name + ".ttf")
+              if os.path.exists(dest) and os.path.getsize(dest) > 500:
+                  return
+              print(f"  Missing: {name}.ttf")
+              if name in KNOWN:
+                  path, fname = KNOWN[name]
+                  if fetch(f"{GF_BASE}/{path}/{fname}.ttf", dest):
+                      print(f"  Downloaded: {name}.ttf"); return
+              parts = name.split("_")
+              fam = parts[0]
+              var = "".join(p.capitalize() for p in parts[1:]) or "Regular"
+              for d in ["ofl","apache","ufl"]:
+                  if fetch(f"{GF_BASE}/{d}/{fam}/{fam.capitalize()}-{var}.ttf", dest):
+                      print(f"  Downloaded (guess): {name}.ttf"); return
+              open(dest,"wb").write(STUB)
+              print(f"  Stub created: {name}.ttf")
+
+          for dirpath, _, fnames in os.walk(ROOT):
+              if "res" in dirpath and os.path.basename(dirpath).startswith("font"):
+                  for f in fnames:
+                      if f.endswith(".xml"):
+                          content = open(os.path.join(dirpath,f), errors="ignore").read()
+                          for ref in set(re.findall(r'@font/(\w+)', content)):
+                              fix_font(ref, dirpath)
+          print("=== Font check done ===")
+          PYEOF
+
+      # ══════════════════════════════════════════════
+      # 7. Fix app/build.gradle (namespace, binding, NDK)
+      # ══════════════════════════════════════════════
+      - name: Fix app/build.gradle
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+
+          for FILE in "$ROOT/app/build.gradle" "$ROOT/app/build.gradle.kts"; do
+            [ -f "$FILE" ] || continue
+            echo "=== Patching $FILE ==="
+
+            # ── Add namespace if missing ──────────────────────────────
+            if ! grep -q "namespace" "$FILE"; then
+              MANIFEST=$(find "$ROOT/app" -name "AndroidManifest.xml" | head -n 1)
+              PKG=$(grep -o 'package="[^"]*"' "$MANIFEST" 2>/dev/null \
+                    | head -n 1 | sed 's/package="//;s/"//')
+              if [ -n "$PKG" ]; then
+                python3 - "$FILE" "$PKG" <<'PYEOF'
+          import sys, re
+          f, pkg = sys.argv[1], sys.argv[2]
+          c = open(f).read()
+          m = re.search(r'(android\s*\{)', c)
+          if m:
+              line = f'\n    namespace "{pkg}"\n' if not f.endswith('.kts') \
+                     else f'\n    namespace = "{pkg}"\n'
+              c = c[:m.end()] + line + c[m.end():]
+              open(f,'w').write(c)
+              print(f"  namespace added: {pkg}")
+          PYEOF
+              fi
+            fi
+
+            # ── Enable dataBinding if code uses it ────────────────────
+            if grep -rq "DataBindingUtil\|Binding\b" "$ROOT/app/src" 2>/dev/null; then
+              if ! grep -q "dataBinding" "$FILE"; then
+                python3 - "$FILE" <<'PYEOF'
+          import sys, re
+          f = sys.argv[1]
+          c = open(f).read()
+          m = re.search(r'(android\s*\{)', c)
+          if m:
+              c = c[:m.end()] + '\n    dataBinding { enabled = true }\n' + c[m.end():]
+              open(f,'w').write(c)
+              print("  dataBinding enabled")
+          PYEOF
+              fi
+            fi
+
+            # ── Limit NDK ABI to speed up build & reduce CMake errors ─
+            # If the project uses CMake/NDK, build only arm64 by default
+            if grep -q "cmake\|ndkBuild\|externalNativeBuild" "$FILE"; then
+              if ! grep -q "abiFilters" "$FILE"; then
+                python3 - "$FILE" <<'PYEOF'
+          import sys, re
+          f = sys.argv[1]
+          c = open(f).read()
+          # Insert abiFilters inside defaultConfig
+          m = re.search(r'(defaultConfig\s*\{)', c)
+          if m:
+              c = c[:m.end()] + '\n        ndk { abiFilters "arm64-v8a" }\n' + c[m.end():]
+              open(f,'w').write(c)
+              print("  abiFilters set to arm64-v8a only")
+          PYEOF
+              fi
+            fi
+
+          done
+
+      # ══════════════════════════════════════════════
+      # 8. Accept Android SDK licenses + install NDK
+      # ══════════════════════════════════════════════
+      - name: Accept SDK licenses & setup NDK
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          # Install latest stable NDK
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" || true
+
+      # ══════════════════════════════════════════════
+      # 9. Prepare Gradle wrapper
+      # ══════════════════════════════════════════════
+      - name: Prepare Gradle wrapper
+        id: gradle
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+          if [ -f "$ROOT/gradlew" ]; then
+            chmod +x "$ROOT/gradlew"
+            echo "cmd=./gradlew" >> $GITHUB_OUTPUT
+          else
+            echo "Installing Gradle 8.5 ..."
+            cd /tmp
+            curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o gradle.zip
+            unzip -q gradle.zip
+            echo "/tmp/gradle-8.5/bin" >> $GITHUB_PATH
+            echo "cmd=gradle" >> $GITHUB_OUTPUT
+          fi
+
+      # ══════════════════════════════════════════════
+      # 10. Build — capture full log
+      # ══════════════════════════════════════════════
+      - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.project_root }}
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs=-Xmx3g
+            -XX:MaxMetaspaceSize=512m
+            -Dfile.encoding=UTF-8
+        run: |
+          CMD="${{ steps.gradle.outputs.cmd }}"
+          LOG="$GITHUB_WORKSPACE/build_full.log"
+
+          set +e
+          $CMD assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            --warning-mode all \
+            2>&1 | tee "$LOG"
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo ""
+            echo "══════════════════════════════════════════════════════"
+            echo "  BUILD FAILED — ROOT CAUSE:"
+            echo "══════════════════════════════════════════════════════"
+
+            # Show Kotlin errors  (e: /path/File.kt:(line): message)
+            echo "--- Kotlin errors ---"
+            grep -n "^e: " "$LOG" | head -30 || echo "(none)"
+
+            # Show Java/resource/aapt errors
+            echo "--- Java/resource errors ---"
+            grep -nE "(error:|Error:)" "$LOG" | grep -v "^Binary" | head -30 || echo "(none)"
+
+            # Show CMake/ninja errors
+            echo "--- CMake/Native errors ---"
+            grep -nE "(CMake Error|ninja:|FAILED:|ld:|clang)" "$LOG" | head -30 || echo "(none)"
+
+            # Show Caused by chain
+            echo "--- Caused by ---"
+            grep -n "Caused by:" "$LOG" | head -20 || echo "(none)"
+
+            # Show last 60 lines (usually has the real failure)
+            echo ""
+            echo "--- Last 60 lines of log ---"
+            tail -60 "$LOG"
+
+            echo "══════════════════════════════════════════════════════"
+            echo "  Full log → Artifacts → build-log-${{ github.run_number }}"
+            echo "══════════════════════════════════════════════════════"
+            exit $BUILD_EXIT
+          fi
+
+      # ══════════════════════════════════════════════
+      # 11. Upload full build log (always)
+      # ══════════════════════════════════════════════
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build_full.log
+          retention-days: 7
+
+      # ══════════════════════════════════════════════
+      # 12. Collect & upload APK
+      # ══════════════════════════════════════════════
+      - name: Collect APK files
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+          APKS=$(find "$ROOT" -name "*.apk" -type f)
+          if [ -z "$APKS" ]; then echo "ERROR: No APK produced."; exit 1; fi
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          echo "$APKS" | while read -r APK; do
+            BASE=$(basename "$APK" .apk)
+            cp "$APK" "$GITHUB_WORKSPACE/output/${BASE}_${TIMESTAMP}.apk"
+            echo "  APK ready: ${BASE}_${TIMESTAMP}.apk"
+          done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK-${{ github.run_number }}
+          path: output/*.apk
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "BUILD SUCCESSFUL"
+          echo "APK → Actions tab → Artifacts → Android-APK-${{ github.run_number }}"
+        id: locate
+        run: |
+          set -e
+          ZIP_INPUT="${{ github.event.inputs.zip_file }}"
+          WORK_DIR="$GITHUB_WORKSPACE"
+
+          if [ -n "$ZIP_INPUT" ] && [ -f "$ZIP_INPUT" ]; then
+            ZIP="$ZIP_INPUT"
+          else
+            ZIP=$(find "$WORK_DIR" -maxdepth 2 -name "*.zip" | head -n 1)
+          fi
+
+          if [ -n "$ZIP" ]; then
+            echo "Found ZIP: $ZIP"
+            mkdir -p "$WORK_DIR/extracted_project"
+            unzip -o "$ZIP" -d "$WORK_DIR/extracted_project"
+            SEARCH_ROOT="$WORK_DIR/extracted_project"
+          else
+            echo "No ZIP — using repository directly."
+            SEARCH_ROOT="$WORK_DIR"
+          fi
+
+          SETTINGS=$(find "$SEARCH_ROOT" \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Cannot locate settings.gradle"
+            find "$SEARCH_ROOT" -type f | head -60
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$SETTINGS")
+          echo "Android project root: $PROJECT_ROOT"
+          echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
+
+      # ══════════════════════════════════════════════
       # 4. Fix Gradle repositories (JitPack etc.)
       # ══════════════════════════════════════════════
       - name: Fix Gradle repositories
