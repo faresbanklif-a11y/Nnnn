@@ -11,28 +11,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip and Smart-Fix Project Structure
+      - name: Unzip and Setup Project
         run: |
-          # 1. البحث عن أي ملف زيب وفكه في مجلد مؤقت
+          # 1. فك الضغط
           ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip "$ZIP_FILE" -d temp_extraction
+          unzip "$ZIP_FILE" -d temp_folder
           
-          # 2. البحث عن المجلد الذي يحتوي على ملف settings.gradle (قلب المشروع)
-          # هذا السطر سيبحث في كل مكان تحت المجلد المستخرج
-          PROJECT_ROOT=$(find temp_extraction -name "settings.gradle" -exec dirname {} \; | head -n 1)
+          # 2. البحث عن مكان المشروع الحقيقي
+          PROJECT_ROOT=$(find temp_folder -name "build.gradle" | head -n 1 | xargs dirname)
           
-          if [ -z "$PROJECT_ROOT" ]; then
-            echo "خطأ: لم يتم العثور على ملفات مشروع أندرويد صالحة داخل الزيب!"
-            ls -R temp_extraction # لطباعة الملفات للتشخيص
-            exit 1
-          fi
-          
-          echo "تم العثور على المشروع في: $PROJECT_ROOT"
-          
-          # 3. نقل كل محتويات المشروع (بما في ذلك الملفات المخفية) إلى المسار الرئيسي
+          # 3. نقل الملفات للمسار الرئيسي
           cp -r "$PROJECT_ROOT"/. .
           
-          # 4. إعطاء صلاحية التشغيل للمحرك
+          # 4. محاولة إصلاح الصلاحيات لو كان الملف موجود
           chmod +x gradlew || true
 
       - name: Set up JDK 17
@@ -40,21 +31,21 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
 
-      - name: Build Debug APK
+      - name: Build APK (The Badass Way)
         run: |
-          # محاولة البناء مع التأكد من وجود الملف
+          # إذا كان الملف المفقود غير موجود، سنستخدم محرك النظام مباشرة
           if [ -f "./gradlew" ]; then
             ./gradlew assembleDebug
           else
-            echo "لا يزال ملف gradlew غير موجود في المسار الرئيسي!"
-            ls -F
-            exit 1
+            echo "المفتاح gradlew مفقود، جاري استخدام المحرك البديل..."
+            # تنصيب محرك البناء يدوياً لو لزم الأمر
+            sudo apt-get install -y gradle
+            gradle assembleDebug
           fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: My-Badass-App
+          name: My-Finished-App
           path: "**/build/outputs/apk/debug/*.apk"
