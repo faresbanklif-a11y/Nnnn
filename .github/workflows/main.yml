@@ -57,7 +57,6 @@ jobs:
       - name: Locate Android project root
         id: find_root
         run: |
-          # Find the directory that contains settings.gradle or settings.gradle.kts
           ROOT=$(find extracted_project -name "settings.gradle" -o -name "settings.gradle.kts" | head -n 1 | xargs dirname)
           if [ -z "$ROOT" ]; then
             echo "ERROR: Could not find Android project root (no settings.gradle found)."
@@ -68,6 +67,46 @@ jobs:
           echo "project_root=$ROOT" >> $GITHUB_OUTPUT
           echo "Android project root: $ROOT"
 
+      # ─────────────────────────────────────────────────────────────────
+      # FIX: Remove invalid files from Android resource directories.
+      # Android only allows specific file types inside res/ sub-folders:
+      #   res/font/   → .xml .ttf .ttc .otf  only
+      #   res/raw/    → any file is OK
+      #   res/layout/ → .xml only
+      #   res/drawable/ res/mipmap/ → .xml .png .jpg .webp only
+      #   res/values/ → .xml only
+      # Placeholder/readme files (.txt, .md, .DS_Store, Thumbs.db, etc.)
+      # will cause "The file name must end with ..." build errors.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Clean up invalid resource files
+        run: |
+          ROOT="${{ steps.find_root.outputs.project_root }}"
+          echo "=== Cleaning invalid files from res/ directories ==="
+
+          # Remove .txt files from font directory (the exact error you hit)
+          find "$ROOT" -path "*/res/font/*.txt" -exec echo "Removing: {}" \; -delete
+
+          # Remove any other non-allowed files from font/
+          find "$ROOT" -path "*/res/font/*" \
+            ! -name "*.xml" ! -name "*.ttf" ! -name "*.ttc" ! -name "*.otf" \
+            -type f \
+            -exec echo "Removing invalid font file: {}" \; -delete
+
+          # Remove .txt / .md / .DS_Store from layout/ values/ drawable/ mipmap/ anim/ menu/
+          for DIR in layout values drawable mipmap anim menu color xml; do
+            find "$ROOT" -path "*/res/${DIR}/*" \
+              ! -name "*.xml" \
+              -type f \
+              -exec echo "Removing invalid ${DIR} file: {}" \; -delete
+          done
+
+          # Remove macOS and Windows junk files anywhere in res/
+          find "$ROOT" -path "*/res/*" \
+            \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \) \
+            -exec echo "Removing junk file: {}" \; -delete
+
+          echo "=== Cleanup complete ==="
+
       - name: Make gradlew executable
         run: |
           ROOT="${{ steps.find_root.outputs.project_root }}"
@@ -75,10 +114,10 @@ jobs:
             chmod +x "$ROOT/gradlew"
             echo "gradlew found and made executable."
           else
-            echo "WARNING: gradlew not found, will try to use system gradle."
+            echo "WARNING: gradlew not found, will try system gradle."
           fi
 
-      - name: Validate Gradle wrapper (security check)
+      - name: Validate Gradle wrapper
         run: |
           ROOT="${{ steps.find_root.outputs.project_root }}"
           if [ -f "$ROOT/gradle/wrapper/gradle-wrapper.properties" ]; then
@@ -107,7 +146,6 @@ jobs:
           fi
           echo "Generated APKs:"
           echo "$APK_FILES"
-          # Store the first APK path
           FIRST_APK=$(echo "$APK_FILES" | head -n 1)
           echo "first_apk=$FIRST_APK" >> $GITHUB_OUTPUT
 
