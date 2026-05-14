@@ -1,29 +1,29 @@
-name: Build Android APK from ZIP
+name: Build Android APK
 
 on:
   push:
-    paths:
-      - 'project.zip'
-      - '**.gradle'
-      - '**.java'
-      - '**.kt'
-      - '**.xml'
   workflow_dispatch:
     inputs:
       zip_file:
-        description: 'Path to the ZIP file inside the repo (e.g. project.zip)'
+        description: 'Path to ZIP file (leave empty to auto-detect or build repo directly)'
         required: false
-        default: 'project.zip'
+        default: ''
 
 jobs:
   build:
-    name: Extract ZIP and Build APK
+    name: Build APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      # ──────────────────────────────────────────────
+      # 1. Checkout
+      # ──────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ──────────────────────────────────────────────
+      # 2. Java 17
+      # ──────────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -31,150 +31,210 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Detect ZIP file
-        id: find_zip
+      # ──────────────────────────────────────────────
+      # 3. Locate the Android project
+      #    Priority:
+      #      A) Explicit ZIP input
+      #      B) Any *.zip in the repo root
+      #      C) The repo itself (project already extracted)
+      # ──────────────────────────────────────────────
+      - name: Locate Android project
+        id: locate
         run: |
-          ZIP="${{ github.event.inputs.zip_file }}"
-          if [ -z "$ZIP" ]; then
-            ZIP=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+          set -e
+
+          ZIP_INPUT="${{ github.event.inputs.zip_file }}"
+          WORK_DIR="$GITHUB_WORKSPACE"
+          EXTRACTED=false
+
+          # --- Try ZIP ---
+          if [ -n "$ZIP_INPUT" ] && [ -f "$ZIP_INPUT" ]; then
+            ZIP="$ZIP_INPUT"
+          else
+            ZIP=$(find "$WORK_DIR" -maxdepth 2 -name "*.zip" | head -n 1)
           fi
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: No ZIP file found in the repository."
+
+          if [ -n "$ZIP" ]; then
+            echo "Found ZIP: $ZIP"
+            mkdir -p "$WORK_DIR/extracted_project"
+            unzip -o "$ZIP" -d "$WORK_DIR/extracted_project"
+            EXTRACTED=true
+            SEARCH_ROOT="$WORK_DIR/extracted_project"
+          else
+            echo "No ZIP found — treating repository as the Android project."
+            SEARCH_ROOT="$WORK_DIR"
+          fi
+
+          # --- Find settings.gradle ---
+          SETTINGS=$(find "$SEARCH_ROOT" \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Cannot locate settings.gradle in the project."
+            echo "Files found:"
+            find "$SEARCH_ROOT" -type f | head -60
             exit 1
           fi
-          echo "zip_path=$ZIP" >> $GITHUB_OUTPUT
-          echo "Found ZIP: $ZIP"
 
-      - name: Extract ZIP file
+          PROJECT_ROOT=$(dirname "$SETTINGS")
+          echo "Android project root: $PROJECT_ROOT"
+
+          echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
+          echo "extracted=$EXTRACTED"       >> $GITHUB_OUTPUT
+
+      # ──────────────────────────────────────────────
+      # 4. Purge ALL invalid files from res/ BEFORE Gradle sees them.
+      #
+      #    Android resource rules:
+      #      res/font/     → only .xml .ttf .ttc .otf
+      #      res/layout/   → only .xml
+      #      res/values*/  → only .xml
+      #      res/drawable/ → only .xml .png .jpg .jpeg .webp .gif
+      #      res/mipmap/   → only .xml .png .jpg .jpeg .webp
+      #      res/anim/     → only .xml
+      #      res/animator/ → only .xml
+      #      res/color/    → only .xml
+      #      res/menu/     → only .xml
+      #      res/xml/      → only .xml
+      #      res/raw/      → any file (skip)
+      #      res/transition/→ only .xml
+      #
+      #    Everything else (.txt, .md, .DS_Store, Thumbs.db, etc.) → DELETE
+      # ──────────────────────────────────────────────
+      - name: Purge invalid resource files
         run: |
-          ZIP="${{ steps.find_zip.outputs.zip_path }}"
-          echo "Extracting $ZIP ..."
-          mkdir -p extracted_project
-          unzip -o "$ZIP" -d extracted_project
-          echo "Contents after extraction:"
-          ls -la extracted_project/
+          set -e
+          ROOT="${{ steps.locate.outputs.project_root }}"
+          echo "=== Purging invalid resource files under: $ROOT ==="
 
-      - name: Locate Android project root
-        id: find_root
-        run: |
-          ROOT=$(find extracted_project -name "settings.gradle" -o -name "settings.gradle.kts" | head -n 1 | xargs dirname)
-          if [ -z "$ROOT" ]; then
-            echo "ERROR: Could not find Android project root (no settings.gradle found)."
-            echo "ZIP contents:"
-            find extracted_project -type f | head -50
-            exit 1
-          fi
-          echo "project_root=$ROOT" >> $GITHUB_OUTPUT
-          echo "Android project root: $ROOT"
+          purge_except() {
+            local DIR_PATTERN="$1"   # e.g. "*/res/font"
+            shift
+            local EXTS=("$@")        # e.g. ".xml" ".ttf" ".ttc" ".otf"
 
-      # ─────────────────────────────────────────────────────────────────
-      # FIX: Remove invalid files from Android resource directories.
-      # Android only allows specific file types inside res/ sub-folders:
-      #   res/font/   → .xml .ttf .ttc .otf  only
-      #   res/raw/    → any file is OK
-      #   res/layout/ → .xml only
-      #   res/drawable/ res/mipmap/ → .xml .png .jpg .webp only
-      #   res/values/ → .xml only
-      # Placeholder/readme files (.txt, .md, .DS_Store, Thumbs.db, etc.)
-      # will cause "The file name must end with ..." build errors.
-      # ─────────────────────────────────────────────────────────────────
-      - name: Clean up invalid resource files
-        run: |
-          ROOT="${{ steps.find_root.outputs.project_root }}"
-          echo "=== Cleaning invalid files from res/ directories ==="
+            # Build the find exclusion arguments
+            EXCLUDE_ARGS=()
+            for EXT in "${EXTS[@]}"; do
+              EXCLUDE_ARGS+=( ! -name "*$EXT" )
+            done
 
-          # Remove .txt files from font directory (the exact error you hit)
-          find "$ROOT" -path "*/res/font/*.txt" -exec echo "Removing: {}" \; -delete
+            find "$ROOT" -path "$DIR_PATTERN" -type d | while read -r DIR; do
+              find "$DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" \
+                | while read -r BAD_FILE; do
+                    echo "  REMOVING: $BAD_FILE"
+                    rm -f "$BAD_FILE"
+                  done
+            done
+          }
 
-          # Remove any other non-allowed files from font/
-          find "$ROOT" -path "*/res/font/*" \
-            ! -name "*.xml" ! -name "*.ttf" ! -name "*.ttc" ! -name "*.otf" \
-            -type f \
-            -exec echo "Removing invalid font file: {}" \; -delete
+          # font — strict
+          purge_except "*/res/font*"     ".xml" ".ttf" ".ttc" ".otf"
 
-          # Remove .txt / .md / .DS_Store from layout/ values/ drawable/ mipmap/ anim/ menu/
-          for DIR in layout values drawable mipmap anim menu color xml; do
-            find "$ROOT" -path "*/res/${DIR}/*" \
-              ! -name "*.xml" \
-              -type f \
-              -exec echo "Removing invalid ${DIR} file: {}" \; -delete
+          # layout, values, anim, animator, color, menu, xml, transition, interpolator
+          for D in layout "values*" anim animator color menu "xml" transition interpolator; do
+            purge_except "*/res/${D}" ".xml"
           done
 
-          # Remove macOS and Windows junk files anywhere in res/
+          # drawable, mipmap
+          purge_except "*/res/drawable*" ".xml" ".png" ".jpg" ".jpeg" ".webp" ".gif"
+          purge_except "*/res/mipmap*"   ".xml" ".png" ".jpg" ".jpeg" ".webp"
+
+          # Navigation, raw, assets — skip (they allow arbitrary content)
+
+          # Junk files anywhere in res/
+          echo "  Removing OS junk files from res/ ..."
           find "$ROOT" -path "*/res/*" \
-            \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \) \
-            -exec echo "Removing junk file: {}" \; -delete
+            \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \
+               -o -name "*.bak"  -o -name "*.orig"    -o -name "*.tmp" \) \
+            -exec echo "  REMOVING: {}" \; -delete
 
-          echo "=== Cleanup complete ==="
+          echo "=== Purge complete ==="
 
-      - name: Make gradlew executable
+      # ──────────────────────────────────────────────
+      # 5. Ensure gradlew is executable
+      # ──────────────────────────────────────────────
+      - name: Prepare Gradle wrapper
+        id: gradle
         run: |
-          ROOT="${{ steps.find_root.outputs.project_root }}"
+          ROOT="${{ steps.locate.outputs.project_root }}"
           if [ -f "$ROOT/gradlew" ]; then
             chmod +x "$ROOT/gradlew"
-            echo "gradlew found and made executable."
+            echo "cmd=./gradlew" >> $GITHUB_OUTPUT
+            echo "gradlew found."
           else
-            echo "WARNING: gradlew not found, will try system gradle."
+            echo "WARNING: gradlew not found — falling back to system Gradle 8.5"
+            # Install a known-good Gradle version
+            cd /tmp
+            curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o gradle.zip
+            unzip -q gradle.zip
+            export PATH="/tmp/gradle-8.5/bin:$PATH"
+            echo "/tmp/gradle-8.5/bin" >> $GITHUB_PATH
+            echo "cmd=gradle" >> $GITHUB_OUTPUT
           fi
 
-      - name: Validate Gradle wrapper
+      # ──────────────────────────────────────────────
+      # 6. Accept Android SDK licenses (prevents hangs)
+      # ──────────────────────────────────────────────
+      - name: Accept Android SDK licenses
         run: |
-          ROOT="${{ steps.find_root.outputs.project_root }}"
-          if [ -f "$ROOT/gradle/wrapper/gradle-wrapper.properties" ]; then
-            echo "gradle-wrapper.properties:"
-            cat "$ROOT/gradle/wrapper/gradle-wrapper.properties"
-          fi
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses \
+            || true   # non-zero exit is fine; licenses may already be accepted
 
-      - name: Build Debug APK
-        working-directory: ${{ steps.find_root.outputs.project_root }}
+      # ──────────────────────────────────────────────
+      # 7. Build Debug APK
+      # ──────────────────────────────────────────────
+      - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.project_root }}
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8"
         run: |
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace --no-daemon \
-              -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"
-          else
-            gradle assembleDebug --stacktrace --no-daemon
-          fi
+          CMD="${{ steps.gradle.outputs.cmd }}"
+          echo "Running: $CMD assembleDebug"
+          $CMD assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            --warning-mode all
 
-      - name: Find generated APK files
-        id: find_apk
+      # ──────────────────────────────────────────────
+      # 8. Collect APK(s)
+      # ──────────────────────────────────────────────
+      - name: Collect APK files
+        id: collect
         run: |
-          ROOT="${{ steps.find_root.outputs.project_root }}"
-          APK_FILES=$(find "$ROOT" -name "*.apk" -type f)
-          if [ -z "$APK_FILES" ]; then
-            echo "ERROR: No APK files found after build."
+          ROOT="${{ steps.locate.outputs.project_root }}"
+          APKS=$(find "$ROOT" -name "*.apk" -type f)
+
+          if [ -z "$APKS" ]; then
+            echo "ERROR: No APK produced."
             exit 1
           fi
-          echo "Generated APKs:"
-          echo "$APK_FILES"
-          FIRST_APK=$(echo "$APK_FILES" | head -n 1)
-          echo "first_apk=$FIRST_APK" >> $GITHUB_OUTPUT
 
-      - name: Rename APK with timestamp
-        id: rename_apk
-        run: |
+          echo "Built APKs:"
+          echo "$APKS"
+
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          SRC="${{ steps.find_apk.outputs.first_apk }}"
-          BASENAME=$(basename "$SRC" .apk)
-          DEST="output/${BASENAME}_${TIMESTAMP}.apk"
-          mkdir -p output
-          cp "$SRC" "$DEST"
-          echo "apk_output=$DEST" >> $GITHUB_OUTPUT
-          echo "APK ready: $DEST"
+          mkdir -p "$GITHUB_WORKSPACE/output"
 
-      - name: Upload APK as GitHub Artifact
+          echo "$APKS" | while read -r APK; do
+            BASE=$(basename "$APK" .apk)
+            DEST="$GITHUB_WORKSPACE/output/${BASE}_${TIMESTAMP}.apk"
+            cp "$APK" "$DEST"
+            echo "  -> $DEST"
+          done
+
+      # ──────────────────────────────────────────────
+      # 9. Upload as GitHub Artifact (downloadable)
+      # ──────────────────────────────────────────────
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SiteForge-APK
+          name: Android-APK-${{ github.run_number }}
           path: output/*.apk
           retention-days: 30
 
-      - name: Print success summary
+      - name: Summary
         run: |
-          echo "============================================"
-          echo "  BUILD SUCCESSFUL"
-          echo "============================================"
-          echo "  APK: ${{ steps.rename_apk.outputs.apk_output }}"
-          echo ""
-          echo "  Download from the Actions tab:"
-          echo "  -> Artifacts section -> SiteForge-APK"
-          echo "============================================"
+          echo "✅ BUILD SUCCESSFUL"
+          echo "Download your APK:"
+          echo "  GitHub → Actions tab → this run → Artifacts section"
