@@ -15,38 +15,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
       # 1. Checkout
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
       # 2. Java 17
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # ──────────────────────────────────────────────
-      # 3. Locate the Android project
-      #    Priority:
-      #      A) Explicit ZIP input
-      #      B) Any *.zip in the repo root
-      #      C) The repo itself (project already extracted)
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 3. Locate Android project
+      #    A) Explicit ZIP input
+      #    B) Any *.zip in the repo
+      #    C) Repo itself (already extracted)
+      # ══════════════════════════════════════════════
       - name: Locate Android project
         id: locate
         run: |
           set -e
-
           ZIP_INPUT="${{ github.event.inputs.zip_file }}"
           WORK_DIR="$GITHUB_WORKSPACE"
-          EXTRACTED=false
 
-          # --- Try ZIP ---
           if [ -n "$ZIP_INPUT" ] && [ -f "$ZIP_INPUT" ]; then
             ZIP="$ZIP_INPUT"
           else
@@ -57,102 +53,221 @@ jobs:
             echo "Found ZIP: $ZIP"
             mkdir -p "$WORK_DIR/extracted_project"
             unzip -o "$ZIP" -d "$WORK_DIR/extracted_project"
-            EXTRACTED=true
             SEARCH_ROOT="$WORK_DIR/extracted_project"
           else
-            echo "No ZIP found — treating repository as the Android project."
+            echo "No ZIP — using repository directly."
             SEARCH_ROOT="$WORK_DIR"
           fi
 
-          # --- Find settings.gradle ---
           SETTINGS=$(find "$SEARCH_ROOT" \
             \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
             | head -n 1)
 
           if [ -z "$SETTINGS" ]; then
             echo "ERROR: Cannot locate settings.gradle in the project."
-            echo "Files found:"
             find "$SEARCH_ROOT" -type f | head -60
             exit 1
           fi
 
           PROJECT_ROOT=$(dirname "$SETTINGS")
           echo "Android project root: $PROJECT_ROOT"
-
           echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
-          echo "extracted=$EXTRACTED"       >> $GITHUB_OUTPUT
 
-      # ──────────────────────────────────────────────
-      # 4. Purge ALL invalid files from res/ BEFORE Gradle sees them.
-      #
-      #    Android resource rules:
-      #      res/font/     → only .xml .ttf .ttc .otf
-      #      res/layout/   → only .xml
-      #      res/values*/  → only .xml
-      #      res/drawable/ → only .xml .png .jpg .jpeg .webp .gif
-      #      res/mipmap/   → only .xml .png .jpg .jpeg .webp
-      #      res/anim/     → only .xml
-      #      res/animator/ → only .xml
-      #      res/color/    → only .xml
-      #      res/menu/     → only .xml
-      #      res/xml/      → only .xml
-      #      res/raw/      → any file (skip)
-      #      res/transition/→ only .xml
-      #
-      #    Everything else (.txt, .md, .DS_Store, Thumbs.db, etc.) → DELETE
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 4. Fix Gradle repositories
+      #    Adds google(), mavenCentral(), and jitpack
+      #    to BOTH settings.gradle (modern style) AND
+      #    top-level build.gradle (legacy style).
+      #    Works on .gradle (Groovy) and .gradle.kts (Kotlin DSL).
+      # ══════════════════════════════════════════════
+      - name: Fix Gradle repositories (add JitPack + Google + Maven)
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+
+          JITPACK_GROOVY='        maven { url "https://jitpack.io" }'
+          JITPACK_KOTLIN='        maven { url = uri("https://jitpack.io") }'
+          REQUIRED_REPOS_GROOVY='        google()\n        mavenCentral()\n        maven { url "https://jitpack.io" }\n        maven { url "https://maven.google.com" }'
+          REQUIRED_REPOS_KOTLIN='        google()\n        mavenCentral()\n        maven { url = uri("https://jitpack.io") }\n        maven { url = uri("https://maven.google.com") }'
+
+          patch_groovy_file() {
+            local FILE="$1"
+            echo "  Patching (Groovy): $FILE"
+
+            # If dependencyResolutionManagement block exists (modern AGP)
+            if grep -q "dependencyResolutionManagement" "$FILE"; then
+              if ! grep -q "jitpack.io" "$FILE"; then
+                # Insert jitpack after the first 'repositories {' inside dependencyResolutionManagement
+                python3 - "$FILE" "$JITPACK_GROOVY" <<'PYEOF'
+          import sys, re
+          file, line_to_insert = sys.argv[1], sys.argv[2]
+          content = open(file).read()
+          # Find dependencyResolutionManagement block and its repositories {
+          pattern = r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)'
+          match = re.search(pattern, content, re.DOTALL)
+          if match:
+              insert_pos = match.end()
+              content = content[:insert_pos] + '\n' + line_to_insert + content[insert_pos:]
+              open(file, 'w').write(content)
+              print("  -> Inserted jitpack into dependencyResolutionManagement.repositories")
+          else:
+              print("  -> dependencyResolutionManagement.repositories block not found, skipping")
+          PYEOF
+              fi
+            fi
+
+            # If allprojects block exists (legacy AGP)
+            if grep -q "allprojects" "$FILE"; then
+              if ! grep -q "jitpack.io" "$FILE"; then
+                python3 - "$FILE" "$JITPACK_GROOVY" <<'PYEOF'
+          import sys, re
+          file, line_to_insert = sys.argv[1], sys.argv[2]
+          content = open(file).read()
+          pattern = r'(allprojects\s*\{[^}]*repositories\s*\{)'
+          match = re.search(pattern, content, re.DOTALL)
+          if match:
+              insert_pos = match.end()
+              content = content[:insert_pos] + '\n' + line_to_insert + content[insert_pos:]
+              open(file, 'w').write(content)
+              print("  -> Inserted jitpack into allprojects.repositories")
+          else:
+              print("  -> allprojects.repositories block not found")
+          PYEOF
+              fi
+            fi
+
+            # Standalone repositories {} block (top-level build.gradle)
+            if grep -q "^repositories" "$FILE" || grep -q "^    repositories" "$FILE"; then
+              if ! grep -q "jitpack.io" "$FILE"; then
+                sed -i '/^repositories\s*{/a\'"$JITPACK_GROOVY" "$FILE" || true
+              fi
+            fi
+          }
+
+          patch_kotlin_file() {
+            local FILE="$1"
+            echo "  Patching (Kotlin DSL): $FILE"
+
+            if grep -q "dependencyResolutionManagement" "$FILE"; then
+              if ! grep -q "jitpack.io" "$FILE"; then
+                python3 - "$FILE" "$JITPACK_KOTLIN" <<'PYEOF'
+          import sys, re
+          file, line_to_insert = sys.argv[1], sys.argv[2]
+          content = open(file).read()
+          pattern = r'(dependencyResolutionManagement\s*\{[^}]*repositories\s*\{)'
+          match = re.search(pattern, content, re.DOTALL)
+          if match:
+              insert_pos = match.end()
+              content = content[:insert_pos] + '\n' + line_to_insert + content[insert_pos:]
+              open(file, 'w').write(content)
+              print("  -> Inserted jitpack (KTS) into dependencyResolutionManagement.repositories")
+          PYEOF
+              fi
+            fi
+          }
+
+          echo "=== Patching Gradle files in: $ROOT ==="
+
+          # Patch settings.gradle (Groovy)
+          if [ -f "$ROOT/settings.gradle" ]; then
+            patch_groovy_file "$ROOT/settings.gradle"
+          fi
+
+          # Patch settings.gradle.kts (Kotlin DSL)
+          if [ -f "$ROOT/settings.gradle.kts" ]; then
+            patch_kotlin_file "$ROOT/settings.gradle.kts"
+          fi
+
+          # Patch top-level build.gradle (Groovy)
+          if [ -f "$ROOT/build.gradle" ]; then
+            patch_groovy_file "$ROOT/build.gradle"
+          fi
+
+          # Patch top-level build.gradle.kts (Kotlin DSL)
+          if [ -f "$ROOT/build.gradle.kts" ]; then
+            patch_kotlin_file "$ROOT/build.gradle.kts"
+          fi
+
+          # Last resort: if STILL no jitpack anywhere, inject into settings.gradle
+          if ! grep -rq "jitpack.io" "$ROOT/"*.gradle 2>/dev/null && \
+             ! grep -rq "jitpack.io" "$ROOT/"*.kts 2>/dev/null; then
+            echo "  LAST RESORT: Appending full repositories block to settings.gradle"
+            cat >> "$ROOT/settings.gradle" <<'GRADLE'
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url "https://jitpack.io" }
+                  maven { url "https://maven.google.com" }
+              }
+          }
+          GRADLE
+          fi
+
+          echo "=== Repository patching complete ==="
+          echo ""
+          echo "--- settings.gradle after patch ---"
+          cat "$ROOT/settings.gradle" 2>/dev/null || true
+          echo "--- build.gradle after patch ---"
+          cat "$ROOT/build.gradle" 2>/dev/null || true
+
+      # ══════════════════════════════════════════════
+      # 5. Purge invalid Android resource files
+      #    res/font/     → only .xml .ttf .ttc .otf
+      #    res/layout/   → only .xml
+      #    res/values*/  → only .xml
+      #    res/drawable/ → only .xml .png .jpg .jpeg .webp .gif
+      #    res/mipmap/   → only .xml .png .jpg .jpeg .webp
+      #    res/anim/     → only .xml
+      #    res/color/    → only .xml
+      #    res/menu/     → only .xml
+      # ══════════════════════════════════════════════
       - name: Purge invalid resource files
         run: |
-          set -e
           ROOT="${{ steps.locate.outputs.project_root }}"
-          echo "=== Purging invalid resource files under: $ROOT ==="
+          echo "=== Purging invalid resource files ==="
 
           purge_except() {
-            local DIR_PATTERN="$1"   # e.g. "*/res/font"
+            local DIR_PATTERN="$1"
             shift
-            local EXTS=("$@")        # e.g. ".xml" ".ttf" ".ttc" ".otf"
-
-            # Build the find exclusion arguments
+            local EXTS=("$@")
             EXCLUDE_ARGS=()
             for EXT in "${EXTS[@]}"; do
               EXCLUDE_ARGS+=( ! -name "*$EXT" )
             done
-
             find "$ROOT" -path "$DIR_PATTERN" -type d | while read -r DIR; do
               find "$DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" \
-                | while read -r BAD_FILE; do
-                    echo "  REMOVING: $BAD_FILE"
-                    rm -f "$BAD_FILE"
+                | while read -r F; do
+                    echo "  REMOVING: $F"
+                    rm -f "$F"
                   done
             done
           }
 
-          # font — strict
-          purge_except "*/res/font*"     ".xml" ".ttf" ".ttc" ".otf"
+          purge_except "*/res/font*"      ".xml" ".ttf" ".ttc" ".otf"
+          purge_except "*/res/layout*"    ".xml"
+          purge_except "*/res/values*"    ".xml"
+          purge_except "*/res/anim*"      ".xml"
+          purge_except "*/res/animator*"  ".xml"
+          purge_except "*/res/color*"     ".xml"
+          purge_except "*/res/menu*"      ".xml"
+          purge_except "*/res/xml*"       ".xml"
+          purge_except "*/res/transition*" ".xml"
+          purge_except "*/res/navigation*" ".xml"
+          purge_except "*/res/drawable*"  ".xml" ".png" ".jpg" ".jpeg" ".webp" ".gif"
+          purge_except "*/res/mipmap*"    ".xml" ".png" ".jpg" ".jpeg" ".webp"
 
-          # layout, values, anim, animator, color, menu, xml, transition, interpolator
-          for D in layout "values*" anim animator color menu "xml" transition interpolator; do
-            purge_except "*/res/${D}" ".xml"
-          done
-
-          # drawable, mipmap
-          purge_except "*/res/drawable*" ".xml" ".png" ".jpg" ".jpeg" ".webp" ".gif"
-          purge_except "*/res/mipmap*"   ".xml" ".png" ".jpg" ".jpeg" ".webp"
-
-          # Navigation, raw, assets — skip (they allow arbitrary content)
-
-          # Junk files anywhere in res/
-          echo "  Removing OS junk files from res/ ..."
           find "$ROOT" -path "*/res/*" \
             \( -name ".DS_Store" -o -name "Thumbs.db" -o -name "desktop.ini" \
                -o -name "*.bak"  -o -name "*.orig"    -o -name "*.tmp" \) \
-            -exec echo "  REMOVING: {}" \; -delete
+            -exec echo "  REMOVING junk: {}" \; -delete
 
           echo "=== Purge complete ==="
 
-      # ──────────────────────────────────────────────
-      # 5. Ensure gradlew is executable
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 6. Prepare Gradle wrapper
+      # ══════════════════════════════════════════════
       - name: Prepare Gradle wrapper
         id: gradle
         run: |
@@ -162,69 +277,55 @@ jobs:
             echo "cmd=./gradlew" >> $GITHUB_OUTPUT
             echo "gradlew found."
           else
-            echo "WARNING: gradlew not found — falling back to system Gradle 8.5"
-            # Install a known-good Gradle version
+            echo "WARNING: gradlew missing — installing Gradle 8.5"
             cd /tmp
             curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o gradle.zip
             unzip -q gradle.zip
-            export PATH="/tmp/gradle-8.5/bin:$PATH"
             echo "/tmp/gradle-8.5/bin" >> $GITHUB_PATH
             echo "cmd=gradle" >> $GITHUB_OUTPUT
           fi
 
-      # ──────────────────────────────────────────────
-      # 6. Accept Android SDK licenses (prevents hangs)
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 7. Accept Android SDK licenses
+      # ══════════════════════════════════════════════
       - name: Accept Android SDK licenses
         run: |
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses \
-            || true   # non-zero exit is fine; licenses may already be accepted
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      # ──────────────────────────────────────────────
-      # 7. Build Debug APK
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 8. Build Debug APK
+      # ══════════════════════════════════════════════
       - name: Build debug APK
         working-directory: ${{ steps.locate.outputs.project_root }}
         env:
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8"
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs=-Xmx2g
+            -XX:MaxMetaspaceSize=512m
+            -Dfile.encoding=UTF-8
         run: |
           CMD="${{ steps.gradle.outputs.cmd }}"
           echo "Running: $CMD assembleDebug"
-          $CMD assembleDebug \
-            --stacktrace \
-            --no-daemon \
-            --warning-mode all
+          $CMD assembleDebug --stacktrace --no-daemon --warning-mode all
 
-      # ──────────────────────────────────────────────
-      # 8. Collect APK(s)
-      # ──────────────────────────────────────────────
+      # ══════════════════════════════════════════════
+      # 9. Collect & upload APK
+      # ══════════════════════════════════════════════
       - name: Collect APK files
-        id: collect
         run: |
           ROOT="${{ steps.locate.outputs.project_root }}"
           APKS=$(find "$ROOT" -name "*.apk" -type f)
-
           if [ -z "$APKS" ]; then
             echo "ERROR: No APK produced."
             exit 1
           fi
-
-          echo "Built APKs:"
-          echo "$APKS"
-
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
           mkdir -p "$GITHUB_WORKSPACE/output"
-
           echo "$APKS" | while read -r APK; do
             BASE=$(basename "$APK" .apk)
-            DEST="$GITHUB_WORKSPACE/output/${BASE}_${TIMESTAMP}.apk"
-            cp "$APK" "$DEST"
-            echo "  -> $DEST"
+            cp "$APK" "$GITHUB_WORKSPACE/output/${BASE}_${TIMESTAMP}.apk"
+            echo "  Collected: ${BASE}_${TIMESTAMP}.apk"
           done
 
-      # ──────────────────────────────────────────────
-      # 9. Upload as GitHub Artifact (downloadable)
-      # ──────────────────────────────────────────────
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -234,6 +335,5 @@ jobs:
 
       - name: Summary
         run: |
-          echo "✅ BUILD SUCCESSFUL"
-          echo "Download your APK:"
-          echo "  GitHub → Actions tab → this run → Artifacts section"
+          echo "BUILD SUCCESSFUL"
+          echo "Download: GitHub Actions tab -> this run -> Artifacts -> Android-APK-${{ github.run_number }}"
