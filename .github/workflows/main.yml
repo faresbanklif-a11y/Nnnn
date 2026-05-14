@@ -11,39 +11,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip and Auto-Fix Path
+      - name: Unzip and Smart-Fix Project Structure
         run: |
-          # البحث عن أي ملف زيب وفكه
+          # 1. البحث عن أي ملف زيب وفكه في مجلد مؤقت
           ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip "$ZIP_FILE" -d temp_folder
+          unzip "$ZIP_FILE" -d temp_extraction
           
-          # البحث عن ملف gradlew (المحرك) في أي مكان داخل المجلد المستخرج
-          GRADLEW_FILE=$(find temp_folder -name gradlew | head -n 1)
+          # 2. البحث عن المجلد الذي يحتوي على ملف settings.gradle (قلب المشروع)
+          # هذا السطر سيبحث في كل مكان تحت المجلد المستخرج
+          PROJECT_ROOT=$(find temp_extraction -name "settings.gradle" -exec dirname {} \; | head -n 1)
           
-          if [ -z "$GRADLEW_FILE" ]; then
-            echo "خطأ: لم يتم العثور على ملفات المشروع داخل الزيب!"
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "خطأ: لم يتم العثور على ملفات مشروع أندرويد صالحة داخل الزيب!"
+            ls -R temp_extraction # لطباعة الملفات للتشخيص
             exit 1
           fi
           
-          # الحصول على المجلد الذي يحتوي على المشروع فعلياً
-          PROJECT_ROOT=$(dirname "$GRADLEW_FILE")
+          echo "تم العثور على المشروع في: $PROJECT_ROOT"
           
-          # نقل كل المحتويات للمجلد الرئيسي ليعمل الروبوت
-          cp -r "$PROJECT_ROOT"/* .
-          chmod +x gradlew
+          # 3. نقل كل محتويات المشروع (بما في ذلك الملفات المخفية) إلى المسار الرئيسي
+          cp -r "$PROJECT_ROOT"/. .
+          
+          # 4. إعطاء صلاحية التشغيل للمحرك
+          chmod +x gradlew || true
 
-      - name: set up JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
 
-      - name: Build with Gradle
-        run: ./gradlew assembleDebug
+      - name: Build Debug APK
+        run: |
+          # محاولة البناء مع التأكد من وجود الملف
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug
+          else
+            echo "لا يزال ملف gradlew غير موجود في المسار الرئيسي!"
+            ls -F
+            exit 1
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: My-Finished-App
-          path: app/build/outputs/apk/debug/*.apk
+          name: My-Badass-App
+          path: "**/build/outputs/apk/debug/*.apk"
