@@ -11,11 +11,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip Project
+      - name: Unzip and Auto-Fix Path
         run: |
-          unzip WebsiteBuilderApp.zip -d project_files
-          # هذا السطر ينقل الملفات للمكان الصحيح للبدء
-          cp -r project_files/*/* . || cp -r project_files/* . || true
+          # البحث عن أي ملف زيب وفكه
+          ZIP_FILE=$(ls *.zip | head -n 1)
+          unzip "$ZIP_FILE" -d temp_folder
+          
+          # البحث عن ملف gradlew (المحرك) في أي مكان داخل المجلد المستخرج
+          GRADLEW_FILE=$(find temp_folder -name gradlew | head -n 1)
+          
+          if [ -z "$GRADLEW_FILE" ]; then
+            echo "خطأ: لم يتم العثور على ملفات المشروع داخل الزيب!"
+            exit 1
+          fi
+          
+          # الحصول على المجلد الذي يحتوي على المشروع فعلياً
+          PROJECT_ROOT=$(dirname "$GRADLEW_FILE")
+          
+          # نقل كل المحتويات للمجلد الرئيسي ليعمل الروبوت
+          cp -r "$PROJECT_ROOT"/* .
+          chmod +x gradlew
 
       - name: set up JDK 17
         uses: actions/setup-java@v4
@@ -23,9 +38,6 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
 
       - name: Build with Gradle
         run: ./gradlew assembleDebug
