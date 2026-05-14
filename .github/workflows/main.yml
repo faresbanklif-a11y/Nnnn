@@ -11,41 +11,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip and Setup Project
+      - name: Unzip and Prepare Project
         run: |
-          # 1. فك الضغط
+          # 1. البحث عن أي ملف زيب وفكه
           ZIP_FILE=$(ls *.zip | head -n 1)
-          unzip "$ZIP_FILE" -d temp_folder
+          unzip "$ZIP_FILE" -d temp_data
           
-          # 2. البحث عن مكان المشروع الحقيقي
-          PROJECT_ROOT=$(find temp_folder -name "build.gradle" | head -n 1 | xargs dirname)
+          # 2. البحث عن المجلد الحقيقي الذي يحتوي على ملف settings.gradle
+          # سننقل كل الملفات للمسار الرئيسي ليعمل النظام
+          CONF_FILE=$(find temp_data -name "settings.gradle" | head -n 1)
+          PROJECT_DIR=$(dirname "$CONF_FILE")
+          cp -rn "$PROJECT_DIR"/* .
           
-          # 3. نقل الملفات للمسار الرئيسي
-          cp -r "$PROJECT_ROOT"/. .
-          
-          # 4. محاولة إصلاح الصلاحيات لو كان الملف موجود
-          chmod +x gradlew || true
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Build APK (The Badass Way)
-        run: |
-          # إذا كان الملف المفقود غير موجود، سنستخدم محرك النظام مباشرة
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug
-          else
-            echo "المفتاح gradlew مفقود، جاري استخدام المحرك البديل..."
-            # تنصيب محرك البناء يدوياً لو لزم الأمر
-            sudo apt-get install -y gradle
-            gradle assembleDebug
-          fi
+      # هذه هي الخطوة السحرية: تثبيت أحدث محرك (Gradle 8.5)
+      - name: Setup Gradle (Modern Version)
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build APK with Modern Gradle
+        run: gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: My-Finished-App
+          name: My-Badass-App
           path: "**/build/outputs/apk/debug/*.apk"
