@@ -503,7 +503,120 @@ jobs:
           PYEOF
 
       # ══════════════════════════════════════════════════════════════
-      # STEP 3 — Accept SDK licenses
+      # STEP 3 — Fix signing config (keystore missing)
+      #   The AI-generated project points to app/debug.keystore
+      #   which doesn't exist. We:
+      #   1. Generate a real debug keystore with keytool
+      #   2. Copy it to every path the project might reference
+      #   3. Patch app/build.gradle to use the standard debug keystore
+      # ══════════════════════════════════════════════════════════════
+      - name: Fix signing keystore
+        run: |
+          ROOT="${{ steps.locate.outputs.project_root }}"
+
+          # ── Generate standard Android debug keystore ──────────────
+          mkdir -p "$HOME/.android"
+          KEYSTORE="$HOME/.android/debug.keystore"
+
+          keytool -genkeypair \
+            -keystore "$KEYSTORE" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -storetype pkcs12 \
+            2>/dev/null || true
+
+          echo "Debug keystore generated: $KEYSTORE"
+
+          # ── Copy keystore to every location the project may expect ─
+          # Common custom paths used by AI-generated projects:
+          find "$ROOT" -name "*.gradle" -o -name "*.gradle.kts" \
+            | xargs grep -l "keystore\|storeFile\|signingConfig" 2>/dev/null \
+            | while read -r GRAD; do
+                # Extract storeFile path from this gradle file
+                STORE_PATHS=$(grep -oP "storeFile\s+file\(['\"]([^'\"]+)['\"]" "$GRAD" \
+                              | grep -oP "['\"]([^'\"]+)['\"]" | tr -d "'\"" || true)
+                for REL_PATH in $STORE_PATHS; do
+                  # Resolve relative to project root and to app dir
+                  for BASE in "$ROOT" "$ROOT/app"; do
+                    DEST="$BASE/$REL_PATH"
+                    mkdir -p "$(dirname "$DEST")"
+                    cp -f "$KEYSTORE" "$DEST" 2>/dev/null && \
+                      echo "  Keystore copied → $DEST" || true
+                  done
+                  # Also copy to the exact absolute path if it starts with /
+                  if [[ "$REL_PATH" == /* ]]; then
+                    mkdir -p "$(dirname "$REL_PATH")"
+                    cp -f "$KEYSTORE" "$REL_PATH" 2>/dev/null && \
+                      echo "  Keystore copied → $REL_PATH" || true
+                  fi
+                done
+              done
+
+          # Always copy to the most common custom path: app/debug.keystore
+          cp -f "$KEYSTORE" "$ROOT/app/debug.keystore" 2>/dev/null && \
+            echo "  Keystore copied → $ROOT/app/debug.keystore" || true
+          cp -f "$KEYSTORE" "$ROOT/debug.keystore" 2>/dev/null || true
+
+          # ── Patch app/build.gradle to use standard signing ────────
+          # Replace any custom signingConfig storeFile with default path,
+          # OR replace the entire custom debug signingConfig with the
+          # standard Android one (uses ~/.android/debug.keystore).
+          python3 - "$ROOT" "$KEYSTORE" << 'PYEOF'
+          import os, re, sys
+
+          ROOT, KEYSTORE = sys.argv[1], sys.argv[2]
+
+          for grad in [f"{ROOT}/app/build.gradle", f"{ROOT}/app/build.gradle.kts"]:
+              if not os.path.exists(grad): continue
+              c = open(grad, encoding='utf-8', errors='ignore').read()
+              orig = c
+
+              # Fix 1: Replace hardcoded storeFile paths with the generated keystore
+              # Groovy: storeFile file('debug.keystore') or storeFile file("debug.keystore")
+              c = re.sub(
+                  r"storeFile\s+file\(['\"]([^'\"]+)['\"]\)",
+                  f'storeFile file("{KEYSTORE}")',
+                  c
+              )
+              # Kotlin DSL: storeFile = file("debug.keystore")
+              c = re.sub(
+                  r'storeFile\s*=\s*file\(["\']([^"\']+)["\']\)',
+                  f'storeFile = file("{KEYSTORE}")',
+                  c
+              )
+
+              # Fix 2: If no signingConfig exists for debug build but
+              # validateSigning still runs, add a default one
+              if 'signingConfig' not in c and 'signingConfigs' not in c:
+                  signing_block = f"""
+              signingConfigs {{
+                  debug {{
+                      storeFile file("{KEYSTORE}")
+                      storePassword "android"
+                      keyAlias "androiddebugkey"
+                      keyPassword "android"
+                  }}
+              }}
+          """
+                  m = re.search(r'(android\s*\{)', c)
+                  if m:
+                      c = c[:m.end()] + signing_block + c[m.end():]
+                      print(f"  signingConfig added to {os.path.basename(grad)}")
+
+              if c != orig:
+                  open(grad, 'w').write(c)
+                  print(f"  Signing config patched in {os.path.basename(grad)}")
+          PYEOF
+
+          echo "=== Signing fix complete ==="
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4 — Accept SDK licenses
       # ══════════════════════════════════════════════════════════════
       - name: Accept Android SDK licenses
         run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
